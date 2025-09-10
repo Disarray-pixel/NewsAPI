@@ -2,11 +2,17 @@ const express = require('express');
 const RSSParser = require('rss-parser');
 const axios = require('axios');
 const cors = require('cors');
-const TelegramParser = require('./telegramParser');
+
+// Подключаем переменные окружения
+require('dotenv').config();
+
+// Подключаем парсеры
+const TelegramParser = require('./telegramParser'); // Старый парсер как fallback
+const TelegramBotParser = require('./TelegramBotParser'); // Новый Bot API парсер
 
 const app = express();
 const parser = new RSSParser();
-const PORT = 3001;
+const PORT = process.env.PORT || 3001;
 
 app.use(cors());
 app.use(express.json());
@@ -15,8 +21,45 @@ app.use(express.json());
 let newsCache = [];
 let lastUpdated = null;
 
-// Инициализируем Telegram парсер
-const telegramParser = new TelegramParser();
+// Инициализируем парсеры с fallback логикой
+let telegramParser;
+let usingBotAPI = false;
+
+async function initializeTelegramParsers() {
+    console.log('\n=== ИНИЦИАЛИЗАЦИЯ TELEGRAM ПАРСЕРОВ ===');
+
+    // Пытаемся инициализировать Bot API парсер
+    if (process.env.TELEGRAM_BOT_TOKEN) {
+        try {
+            telegramParser = new TelegramBotParser();
+
+            // Тестируем доступность Bot API
+            const testResponse = await axios.get(
+                `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/getMe`,
+                { timeout: 5000 }
+            );
+
+            if (testResponse.data && testResponse.data.ok) {
+                console.log('✅ Telegram Bot API инициализирован успешно');
+                console.log(`Bot: ${testResponse.data.result.first_name} (@${testResponse.data.result.username})`);
+                usingBotAPI = true;
+                return;
+            }
+        } catch (error) {
+            console.log('❌ Telegram Bot API недоступен:', error.message);
+        }
+    } else {
+        console.log('⚠️  TELEGRAM_BOT_TOKEN не найден в переменных окружения');
+    }
+
+    // Fallback на старый парсер
+    console.log('🔄 Переключаемся на веб-скрапинг парсер (fallback)');
+    telegramParser = new TelegramParser();
+    usingBotAPI = false;
+    console.log('=========================================\n');
+}
+
+// Остальной код (функции RSS парсинга, endpoints и т.д.) - такой же как в оригинале
 
 // Нижегородские источники новостей (проверенные)
 const sources = [
@@ -53,10 +96,8 @@ const sources = [
 // Функция для определения русского языка
 function isRussianText(text) {
     if (!text) return false;
-    const cyrillicRegex = /[а-яё]/i;
     const cyrillicCount = (text.match(/[а-яё]/gi) || []).length;
     const totalLetters = (text.match(/[а-яёa-z]/gi) || []).length;
-
     return cyrillicCount > 0 && totalLetters > 0 && (cyrillicCount / totalLetters) > 0.3;
 }
 
@@ -74,29 +115,21 @@ async function checkNewsRegion(url, sourceId) {
 
         // Специальная проверка для НТА Приволжье
         if (sourceId === 'nta_pfo') {
-            // Ищем span с классом region
             const regionMatch = html.match(/<span class="region">Регион:\s*([^<]+)<\/span>/i);
             if (regionMatch) {
                 const region = regionMatch[1].trim();
                 console.log(`    Регион новости: ${region}`);
-
-                // Проверяем что это именно Нижний Новгород
                 return region.toLowerCase().includes('нижний новгород') ||
                     region.toLowerCase().includes('нижегородская');
             }
-
-            // Если не нашли регион, проверяем в тексте упоминания НН
             const nnMentions = html.match(/нижн(ий|его)\s+новгород/gi);
             return nnMentions && nnMentions.length > 0;
         }
-
-        // Для остальных источников считаем что новости локальные
         return true;
 
     } catch (error) {
         console.log(`    Ошибка проверки региона для ${url}:`, error.message);
-        // Если не смогли проверить, пропускаем новость для безопасности
-        return sourceId !== 'nta_pfo'; // Для НТА требуем проверки, для остальных пропускаем
+        return sourceId !== 'nta_pfo';
     }
 }
 
@@ -205,13 +238,11 @@ async function fetchNews() {
                     let processedCount = 0;
                     let regionFilteredCount = 0;
 
-                    for (const item of feed.items.slice(0, 20)) { // Берем больше для учета фильтрации
-                        // Фильтрация по русскому языку
+                    for (const item of feed.items.slice(0, 20)) {
                         if (!isRussianText(item.title)) {
                             continue;
                         }
 
-                        // Проверка региона (особенно важно для НТА Приволжье)
                         if (source.id === 'nta_pfo' && item.link) {
                             console.log(`    Проверяем регион для: ${item.title.substring(0, 60)}...`);
                             const isNizhnyNovgorod = await checkNewsRegion(item.link, source.id);
@@ -224,7 +255,6 @@ async function fetchNews() {
                             console.log(`    ✓ Нижний Новгород`);
                         }
 
-                        // Попытка найти изображение в RSS
                         let imageUrl = null;
                         if (item.enclosure && item.enclosure.url) {
                             imageUrl = item.enclosure.url;
@@ -235,7 +265,6 @@ async function fetchNews() {
                             }
                         }
 
-                        // Если изображения нет в RSS, пытаемся извлечь со страницы
                         if (!imageUrl && item.link) {
                             imageUrl = await extractImageFromUrl(item.link, source.id);
                         }
@@ -262,7 +291,7 @@ async function fetchNews() {
                         allNews.push(newsItem);
                         processedCount++;
 
-                        if (processedCount >= 15) break; // Ограничиваем по 15 новостей с источника
+                        if (processedCount >= 15) break;
                     }
 
                     console.log(`  Обработано: ${processedCount} новостей`);
@@ -285,9 +314,11 @@ async function fetchNews() {
         } catch (error) {
             console.error(`Общая ошибка парсинга ${source.name}:`, error.message);
         }
+
+        // Пауза между источниками
+        await new Promise(resolve => setTimeout(resolve, 1000));
     }
 
-    // Удаляем дубликаты и сортируем по дате
     const uniqueNews = allNews.filter((item, index, self) =>
         index === self.findIndex(t => t.sourceUrl === item.sourceUrl)
     );
@@ -301,7 +332,6 @@ async function fetchNews() {
     console.log(`Всего загружено ${newsCache.length} нижегородских новостей`);
     console.log(`С изображениями: ${newsCache.filter(item => item.imageUrl).length}`);
 
-    // Статистика по источникам
     const sourceStats = {};
     newsCache.forEach(item => {
         sourceStats[item.source.name] = (sourceStats[item.source.name] || 0) + 1;
@@ -312,6 +342,49 @@ async function fetchNews() {
         console.log(`  ${name}: ${count} новостей`);
     });
     console.log('===============\n');
+}
+
+// Улучшенная функция для парсинга Telegram с fallback
+async function fetchTelegramNews() {
+    console.log(`\n=== TELEGRAM ПАРСИНГ (${usingBotAPI ? 'Bot API' : 'Web Scraping'}) ===`);
+
+    try {
+        if (usingBotAPI) {
+            const result = await telegramParser.fetchTelegramNews();
+
+            if (result && result.length > 0) {
+                console.log('✅ Bot API парсинг успешен');
+                return result;
+            }
+
+            console.log('⚠️  Bot API не вернул результатов, переключаемся на веб-скрапинг...');
+
+            if (!(telegramParser instanceof TelegramParser)) {
+                telegramParser = new TelegramParser();
+                usingBotAPI = false;
+            }
+        }
+
+        const result = await telegramParser.fetchTelegramNews();
+        return result;
+
+    } catch (error) {
+        console.error('❌ Ошибка Telegram парсинга:', error.message);
+
+        if (usingBotAPI) {
+            console.log('🔄 Пытаемся fallback на веб-скрапинг...');
+            try {
+                telegramParser = new TelegramParser();
+                usingBotAPI = false;
+                return await telegramParser.fetchTelegramNews();
+            } catch (fallbackError) {
+                console.error('❌ Fallback тоже упал:', fallbackError.message);
+                return [];
+            }
+        }
+
+        return [];
+    }
 }
 
 function formatPublishDate(dateString) {
@@ -339,11 +412,13 @@ app.get('/health', (req, res) => {
         sourceStats[item.source.name] = (sourceStats[item.source.name] || 0) + 1;
     });
 
-    const telegramStats = telegramParser.getStats();
+    const telegramStats = telegramParser ? telegramParser.getStats() : { total: 0 };
 
     res.json({
         status: 'OK',
         timestamp: new Date().toISOString(),
+        telegram_mode: usingBotAPI ? 'Bot API' : 'Web Scraping',
+        environment: process.env.NODE_ENV || 'development',
         rss: {
             cachedNews: newsCache.length,
             lastUpdated: lastUpdated,
@@ -351,10 +426,11 @@ app.get('/health', (req, res) => {
             workingSources: Object.keys(sourceStats).length
         },
         telegram: {
-            cachedNews: telegramStats.total,
+            cachedNews: telegramStats.total || 0,
             lastUpdated: telegramStats.lastUpdated,
-            channels: telegramStats.channels,
-            workingChannels: Object.keys(telegramStats.channels || {}).length
+            channels: telegramStats.channels || {},
+            workingChannels: Object.keys(telegramStats.channels || {}).length,
+            mode: usingBotAPI ? 'Bot API' : 'Web Scraping'
         }
     });
 });
@@ -383,33 +459,33 @@ app.get('/api/news/:city', (req, res) => {
     }
 });
 
-// Telegram новости
 app.get('/api/telegram/news', (req, res) => {
-    const telegramNews = telegramParser.getCachedNews();
+    const telegramNews = telegramParser ? telegramParser.getCachedNews() : { data: [], total: 0 };
     res.json({
         success: true,
-        data: telegramNews.data,
-        total: telegramNews.total,
+        data: telegramNews.data || [],
+        total: telegramNews.total || 0,
         source: 'telegram',
+        mode: usingBotAPI ? 'Bot API' : 'Web Scraping',
         timestamp: new Date().toISOString()
     });
 });
 
-// Статистика Telegram
 app.get('/api/telegram/stats', (req, res) => {
-    const stats = telegramParser.getStats();
-    res.json(stats);
+    const stats = telegramParser ? telegramParser.getStats() : { total: 0 };
+    res.json({
+        ...stats,
+        mode: usingBotAPI ? 'Bot API' : 'Web Scraping'
+    });
 });
 
-// Объединенные новости (RSS + Telegram)
 app.get('/api/news/combined/:city', (req, res) => {
     const { city } = req.params;
 
     if (city === 'nizhny-novgorod' || city === 'нижний-новгород') {
         const rssNews = newsCache;
-        const telegramNews = telegramParser.getCachedNews().data;
+        const telegramNews = telegramParser ? telegramParser.getCachedNews().data : [];
 
-        // Объединяем и сортируем новости
         const combined = [...rssNews, ...telegramNews]
             .sort((a, b) => new Date(b.rawDate) - new Date(a.rawDate))
             .slice(0, 100);
@@ -422,6 +498,7 @@ app.get('/api/news/combined/:city', (req, res) => {
                 rss: rssNews.length,
                 telegram: telegramNews.length
             },
+            telegram_mode: usingBotAPI ? 'Bot API' : 'Web Scraping',
             city: 'Нижний Новгород',
             timestamp: new Date().toISOString()
         });
@@ -444,7 +521,7 @@ app.get('/api/news/stats', (req, res) => {
         sourceStats[sourceName] = (sourceStats[sourceName] || 0) + 1;
     });
 
-    const telegramStats = telegramParser.getStats();
+    const telegramStats = telegramParser ? telegramParser.getStats() : { total: 0 };
 
     res.json({
         rss: {
@@ -455,26 +532,45 @@ app.get('/api/news/stats', (req, res) => {
             city: 'Нижний Новгород',
             workingSources: Object.keys(sourceStats).length
         },
-        telegram: telegramStats
+        telegram: {
+            ...telegramStats,
+            mode: usingBotAPI ? 'Bot API' : 'Web Scraping'
+        }
     });
 });
 
+app.post('/api/telegram/switch-mode', async (req, res) => {
+    try {
+        await initializeTelegramParsers();
+        res.json({
+            success: true,
+            new_mode: usingBotAPI ? 'Bot API' : 'Web Scraping',
+            message: `Переключено на ${usingBotAPI ? 'Bot API' : 'веб-скрапинг'}`
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
 // Запуск сервера
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
     console.log(`Сервер запущен на http://localhost:${PORT}`);
+    console.log(`Окружение: ${process.env.NODE_ENV || 'development'}`);
+
+    // Инициализируем Telegram парсеры
+    await initializeTelegramParsers();
+
     console.log('Загружаем новости Нижнего Новгорода...');
 
-    // Первоначальная загрузка RSS
     fetchNews();
 
-    // Первоначальная загрузка Telegram (с задержкой)
     setTimeout(() => {
-        telegramParser.fetchTelegramNews();
+        fetchTelegramNews();
     }, 5000);
 
-    // Обновление RSS каждые 20 минут
     setInterval(fetchNews, 20 * 60 * 1000);
-
-    // Обновление Telegram каждые 30 минут (реже чтобы не блокировали)
-    setInterval(() => telegramParser.fetchTelegramNews(), 30 * 60 * 1000);
+    setInterval(() => fetchTelegramNews(), 30 * 60 * 1000);
 });
